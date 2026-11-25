@@ -22,7 +22,7 @@ interface WorkspaceBotStatus {
 }
 
 export function FeishuConfigDialog({ open, onOpenChange }: FeishuConfigDialogProps) {
-  const [config, setConfig] = useState({ appId: '', appSecret: '' });
+  const [config, setConfig] = useState({ appId: '', appSecret: '', hasSecret: false });
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveMsg, setSaveMsg] = useState('');
@@ -41,7 +41,11 @@ export function FeishuConfigDialog({ open, onOpenChange }: FeishuConfigDialogPro
       setBotMsg('');
       Promise.all([
         api.getFeishuConfig().then(data => {
-          setConfig({ appId: data.appId || '', appSecret: data.appSecret || '' });
+          setConfig({
+            appId: data.appId || '',
+            appSecret: data.appSecret || '',
+            hasSecret: Boolean(data.hasSecret || data.appSecret),
+          });
         }),
         api.getWorkspaceBots().then(data => {
           setWsBots(data.bots || []);

@@ -1,6 +1,7 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+import { readFileSync, existsSync, mkdirSync, copyFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { homedir } from 'os';
+import { atomicWriteFileSync } from '@/lib/bridge/path-utils';
 
 const STORE_PATH = join(homedir(), '.gemini', 'antigravity', 'feishu-chats.json');
 
@@ -19,12 +20,24 @@ export interface FeishuUserSession {
   botAppId?: string;          // Application ID of the bot handling this session
 }
 
+function backupCorruptFile(filePath: string) {
+  try {
+    if (existsSync(filePath)) {
+      const backup = `${filePath}.corrupt-${Date.now()}`;
+      copyFileSync(filePath, backup);
+      console.error(`[FeishuStore] Backed up corrupt file to ${backup}`);
+    }
+  } catch {}
+}
+
 export const feishuStore = {
   load(): Record<string, FeishuUserSession> {
+    if (!existsSync(STORE_PATH)) return {};
     try {
-      if (!existsSync(STORE_PATH)) return {};
       return JSON.parse(readFileSync(STORE_PATH, 'utf-8'));
-    } catch {
+    } catch (e) {
+      console.error('Failed to parse feishu store, backing up corrupt file', e);
+      backupCorruptFile(STORE_PATH);
       return {};
     }
   },
@@ -32,7 +45,7 @@ export const feishuStore = {
   save(data: Record<string, FeishuUserSession>) {
     try {
       mkdirSync(dirname(STORE_PATH), { recursive: true });
-      writeFileSync(STORE_PATH, JSON.stringify(data, null, 2), 'utf-8');
+      atomicWriteFileSync(STORE_PATH, JSON.stringify(data, null, 2));
     } catch (e) {
       console.error('Failed to save feishu store', e);
     }

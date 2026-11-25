@@ -1,7 +1,9 @@
 import { NextResponse } from 'next/server';
 import { getAllConnections, grpc } from '@/lib/bridge/gateway';
+import { uriToFsPath, isPathInside, isSafeId } from '@/lib/bridge/path-utils';
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 
 export const dynamic = 'force-dynamic';
 
@@ -59,21 +61,37 @@ export async function GET(request: Request) {
 export async function POST(req: Request) {
   try {
     const body = await req.json();
+    const homeDir = os.homedir();
+
+    async function isAllowedWorkspaceRoot(targetWsPath: string): Promise<boolean> {
+      if (isPathInside(targetWsPath, homeDir)) return true;
+      const conns = await getAllConnections().catch(() => []);
+      return conns.some(c => c.workspace && isPathInside(targetWsPath, uriToFsPath(c.workspace)));
+    }
+
     if (body.action === 'install') {
       const { sourceBaseDir, workspaceUri } = body;
       if (!sourceBaseDir || !workspaceUri) {
         return NextResponse.json({ error: 'Missing parameters' }, { status: 400 });
       }
       
-      let wsPath = workspaceUri.replace(/^file:\/\//, '');
-      try { wsPath = decodeURIComponent(wsPath); } catch {}
-      if (process.platform === 'win32' && /^\/[a-zA-Z]:/.test(wsPath)) {
-        wsPath = wsPath.slice(1);
+      const resolvedSource = path.resolve(uriToFsPath(sourceBaseDir));
+      const wsPath = path.resolve(uriToFsPath(workspaceUri));
+      const skillName = path.basename(resolvedSource);
+      if (!isSafeId(skillName) || !isPathInside(resolvedSource, homeDir) && !(await isAllowedWorkspaceRoot(resolvedSource))) {
+        return NextResponse.json({ error: 'Invalid or forbidden source path' }, { status: 403 });
       }
-      const skillName = path.basename(sourceBaseDir);
-      const targetDir = path.join(wsPath, '.agents', 'skills', skillName);
+      if (!(await isAllowedWorkspaceRoot(wsPath))) {
+        return NextResponse.json({ error: 'Forbidden target workspace' }, { status: 403 });
+      }
+
+      const skillsRoot = path.join(wsPath, '.agents', 'skills');
+      const targetDir = path.join(skillsRoot, skillName);
+      if (!isPathInside(targetDir, skillsRoot)) {
+        return NextResponse.json({ error: 'Invalid target skill path' }, { status: 400 });
+      }
       
-      if (!fs.existsSync(sourceBaseDir)) {
+      if (!fs.existsSync(resolvedSource)) {
         return NextResponse.json({ error: 'Source skill not found' }, { status: 404 });
       }
       
@@ -82,25 +100,34 @@ export async function POST(req: Request) {
       }
       
       fs.mkdirSync(path.dirname(targetDir), { recursive: true });
-      fs.cpSync(sourceBaseDir, targetDir, { recursive: true });
+      fs.cpSync(resolvedSource, targetDir, { recursive: true });
       
       return NextResponse.json({ success: true, targetDir });
     }
     
     if (body.action === 'importGlobal') {
       const { sourceDir } = body;
-      if (!sourceDir) {
+      if (!sourceDir || typeof sourceDir !== 'string') {
         return NextResponse.json({ error: 'Missing source directory' }, { status: 400 });
       }
 
-      const os = await import('os');
-      const resolvedSource = sourceDir.replace(/^~/, os.homedir());
+      const resolvedSource = path.resolve(sourceDir.startsWith('~') ? sourceDir.replace(/^~/, homeDir) : uriToFsPath(sourceDir));
+      if (!(await isAllowedWorkspaceRoot(resolvedSource))) {
+        return NextResponse.json({ error: 'Forbidden source path' }, { status: 403 });
+      }
       if (!fs.existsSync(resolvedSource)) {
         return NextResponse.json({ error: 'Source directory not found' }, { status: 404 });
       }
 
       const skillName = path.basename(resolvedSource);
-      const targetDir = path.join(os.homedir(), '.agents', 'skills', skillName);
+      if (!isSafeId(skillName)) {
+        return NextResponse.json({ error: 'Invalid skill folder name' }, { status: 400 });
+      }
+      const globalSkillsRoot = path.join(homeDir, '.agents', 'skills');
+      const targetDir = path.join(globalSkillsRoot, skillName);
+      if (!isPathInside(targetDir, globalSkillsRoot)) {
+        return NextResponse.json({ error: 'Invalid target path' }, { status: 400 });
+      }
 
       if (fs.existsSync(targetDir)) {
         return NextResponse.json({ error: 'Global skill with this name already exists' }, { status: 400 });
@@ -114,13 +141,16 @@ export async function POST(req: Request) {
     
     if (body.action === 'installCloud') {
       const { slug } = body;
-      if (!slug) {
-        return NextResponse.json({ error: 'Missing slug' }, { status: 400 });
+      if (!slug || !isSafeId(slug)) {
+        return NextResponse.json({ error: 'Invalid or missing slug' }, { status: 400 });
       }
 
-      const os = await import('os');
-      const { execSync } = await import('child_process');
-      const targetDir = path.join(os.homedir(), '.agents', 'skills', slug);
+      const { execFileSync } = await import('child_process');
+      const globalSkillsRoot = path.join(homeDir, '.agents', 'skills');
+      const targetDir = path.join(globalSkillsRoot, slug);
+      if (!isPathInside(targetDir, globalSkillsRoot)) {
+        return NextResponse.json({ error: 'Invalid target path' }, { status: 400 });
+      }
 
       if (fs.existsSync(targetDir)) {
         return NextResponse.json({ error: 'Global skill already exists, please delete it first or update' }, { status: 400 });
@@ -129,7 +159,7 @@ export async function POST(req: Request) {
       const tmpZipPath = path.join(os.tmpdir(), `${slug}-${Date.now()}.zip`);
       
       try {
-        const res = await fetch(`https://skillhub-1388575217.cos.ap-guangzhou.myqcloud.com/skills/${slug}.zip`);
+        const res = await fetch(`https://skillhub-1388575217.cos.ap-guangzhou.myqcloud.com/skills/${encodeURIComponent(slug)}.zip`);
         if (!res.ok) throw new Error(`Failed to download: ${res.statusText}`);
         
         const arrayBuffer = await res.arrayBuffer();
@@ -137,15 +167,16 @@ export async function POST(req: Request) {
         
         fs.mkdirSync(targetDir, { recursive: true });
         try {
-          execSync(`tar -xf "${tmpZipPath}" -C "${targetDir}"`, { stdio: 'ignore' });
+          execFileSync('tar', ['-xf', tmpZipPath, '-C', targetDir], { stdio: 'ignore' });
         } catch {
           if (process.platform === 'win32') {
-            execSync(
-              `powershell -NoProfile -NonInteractive -Command "Expand-Archive -LiteralPath '${tmpZipPath.replace(/'/g, "''")}' -DestinationPath '${targetDir.replace(/'/g, "''")}' -Force"`,
-              { stdio: 'ignore' }
+            execFileSync(
+              'powershell',
+              ['-NoProfile', '-NonInteractive', '-Command', 'Expand-Archive -LiteralPath $env:AG_ZIP -DestinationPath $env:AG_DEST -Force'],
+              { stdio: 'ignore', env: { ...process.env, AG_ZIP: tmpZipPath, AG_DEST: targetDir } }
             );
           } else {
-            execSync(`unzip -q -o "${tmpZipPath}" -d "${targetDir}"`, { stdio: 'ignore' });
+            execFileSync('unzip', ['-q', '-o', tmpZipPath, '-d', targetDir], { stdio: 'ignore' });
           }
         }
         

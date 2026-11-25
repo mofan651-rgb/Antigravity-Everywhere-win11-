@@ -37,7 +37,7 @@ function getWsName(uri: string) {
 
 export default function BotManagementPanel({ open, onClose }: BotManagementPanelProps) {
   // Global bot state
-  const [globalConfig, setGlobalConfig] = useState({ appId: '', appSecret: '', showThoughts: false });
+  const [globalConfig, setGlobalConfig] = useState({ appId: '', appSecret: '', hasSecret: false, showThoughts: false });
   const [globalModel, setGlobalModel] = useState('');
   const [globalSaving, setGlobalSaving] = useState(false);
   const [globalMsg, setGlobalMsg] = useState('');
@@ -73,6 +73,7 @@ export default function BotManagementPanel({ open, onClose }: BotManagementPanel
       setGlobalConfig({
         appId: configData.appId || '',
         appSecret: configData.appSecret || '',
+        hasSecret: Boolean(configData.hasSecret || configData.appSecret),
         showThoughts: Boolean(configData.showThoughts),
       });
       setWsBots(botsData.bots || []);
@@ -512,7 +513,7 @@ export default function BotManagementPanel({ open, onClose }: BotManagementPanel
                         type="password"
                         value={globalConfig.appSecret}
                         onChange={e => setGlobalConfig({ ...globalConfig, appSecret: e.target.value })}
-                        placeholder="应用秘钥"
+                        placeholder={globalConfig.hasSecret ? '已配置（留空保持不变）' : '应用秘钥'}
                         className="font-mono text-xs h-9"
                       />
                     </div>

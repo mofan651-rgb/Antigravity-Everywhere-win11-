@@ -4,6 +4,7 @@ import path from 'path';
 import os from 'os';
 import { getAllConnections, grpc } from '@/lib/bridge/gateway';
 import { removeLocalConversations } from '@/lib/bridge/statedb';
+import { isUuid } from '@/lib/bridge/path-utils';
 
 export async function POST(req: Request) {
   try {
@@ -22,9 +23,12 @@ export async function POST(req: Request) {
       const deletedIds: string[] = [];
 
       for (const id of ids) {
-        // Sanitize ID to prevent directory traversal
-        const safeId = path.basename(String(id || ''));
-        if (!safeId) continue;
+        // Strict UUID validation to prevent path traversal or accidental file deletion
+        const safeId = String(id || '').trim();
+        if (!isUuid(safeId)) {
+          failedCount++;
+          continue;
+        }
 
         let deletedThis = false;
 

@@ -27,7 +27,7 @@
   - `/think` —— 开启/关闭在飞书卡片中实时显示 AI 思考过程（`thinking`）与工具执行步骤
   - `/usage` `/u` —— 查询模型配额与本地用量统计
   - `/help` `/?` —— 查看指令帮助
-- **多机器人隔离**：支持「全局调度机器人」+「工作区专属机器人」，也可在 Web 控制台「飞书配置」面板一键开关思考过程展示。
+- **多机器人隔离**：支持「全局调度机器人」+「工作区专属机器人」（专属机器人支持直接对话、`/?` `/help` 帮助与 `/think` 切换思考过程），也可在 Web 控制台「飞书机器人管理中心」面板一键开关思考过程展示。
 
 ### 3. Windows 与 Antigravity 2.0 深度适配
 - **自动进程发现**：Windows 下通过 WMI/PowerShell 精确发现 `language_server.exe` 并探活端口与 CSRF Token（macOS/Linux 保持 `ps` + `lsof`）。
@@ -68,8 +68,9 @@ npm install
 git clone https://github.com/mofan651-rgb/Antigravity-Everywhere-win11-.git
 cd Antigravity-Everywhere-win11-
 npm install
-npm run dev
+npm run build && npm start
 ```
+*(开发调试可使用 `npm run dev`)*
 
 ---
 
@@ -86,12 +87,12 @@ python scripts/feishu-qr-setup.py
 
 1. 终端会输出二维码，使用手机 **飞书 / Lark** 扫码确认创建应用。
 2. 脚本会自动把 `appId` 和 `appSecret` 写入 `~/.gemini/antigravity/feishu-config.json`。
-3. 打开 Web 控制台 `http://localhost:3000` → 底部 **「飞书配置」** → 点击 **「保存并连接」**（或重启 Gateway）即可在飞书直接对话。
+3. 打开 Web 控制台 `http://localhost:3000` → 底部 **「飞书机器人管理中心」** → 点击 **「保存并重连」**（或重启 Gateway）即可在飞书直接对话。
 
 ### 方式二：手动填入已有自建应用
 
 1. 在 [飞书开放平台](https://open.feishu.cn) 创建企业自建应用，开启机器人能力与 **长连接（WebSocket）** 事件订阅（`im.message.receive_v1`）。
-2. 在 Web 控制台 **「飞书配置」** 中填入 `App ID` 与 `App Secret`，点击 **「保存并连接」**。
+2. 在 Web 控制台 **「飞书机器人管理中心」** 中填入 `App ID` 与 `App Secret`，点击 **「保存并重连」**。
 
 ---
 
@@ -103,7 +104,7 @@ python scripts/feishu-qr-setup.py
   npm install
   npm run build
   ```
-- **远程访问 Web 控制台（可选）**：如需在手机浏览器直接访问本机控制台，可安装 `cloudflared`（Windows 可用 `winget install --id Cloudflare.cloudflared`）并在面板的 **「内网穿透」** 中配置 Cloudflare Named Tunnel；若仅使用飞书控制则无需开启。
+- **远程访问与安全提醒（重要）**：Web 控制台默认仅监听 `127.0.0.1:3000` 且**不自带登录鉴权**。如需在手机浏览器远程访问，可安装 `cloudflared`（Windows 可用 `winget install --id Cloudflare.cloudflared`）并在面板的 **「内网穿透」** 中配置 Cloudflare Named Tunnel——**暴露到公网前请务必在 Cloudflare Zero Trust / Access 中配置身份认证策略**，避免未授权访问本地工作区与执行能力；若仅使用飞书远程控制则无需开启穿透。
 
 ---
 

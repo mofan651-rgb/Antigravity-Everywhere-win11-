@@ -1,8 +1,9 @@
 import { NextResponse } from 'next/server';
-import { execFileSync } from 'child_process';
+import { spawn } from 'child_process';
 import { existsSync } from 'fs';
 import path from 'path';
 import { createLogger } from '@/lib/logger';
+import { uriToFsPath } from '@/lib/bridge/path-utils';
 
 const log = createLogger('Launch');
 
@@ -27,19 +28,18 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: 'Missing workspace path' }, { status: 400 });
   }
 
-  let wsPath = decodeURIComponent(workspace.replace(/^file:\/\//, ''));
-  if (process.platform === 'win32' && /^\/[a-zA-Z]:/.test(wsPath)) {
-    wsPath = wsPath.slice(1);
-  }
-
+  const wsPath = uriToFsPath(workspace);
   log.info({ wsPath }, 'Opening workspace');
 
   try {
-    execFileSync(getAntigravityCli(), ['--new-window', wsPath], {
-      timeout: 5000,
+    const cli = getAntigravityCli();
+    const child = spawn(cli, ['--new-window', wsPath], {
+      detached: true,
       stdio: 'ignore',
+      shell: process.platform === 'win32' && !cli.endsWith('.exe'),
     });
-    log.info({ wsPath }, 'Antigravity CLI executed');
+    child.unref();
+    log.info({ wsPath }, 'Antigravity CLI spawned');
     return NextResponse.json({ ok: true, launched: wsPath });
   } catch (e: any) {
     log.error({ err: e.message, wsPath }, 'Launch failed');

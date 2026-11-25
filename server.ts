@@ -30,7 +30,7 @@ process.on('uncaughtException', (err: Error) => {
 });
 
 const dev = process.env.NODE_ENV !== 'production';
-const hostname = '0.0.0.0';
+const hostname = process.env.HOST || '127.0.0.1';
 const port = parseInt(process.env.PORT || '3000');
 
 const app = next({ dev, hostname, port });
@@ -55,9 +55,18 @@ async function ensureBridge() {
     
     // --- Security Fix: Prevent external access to internal routes ---
     if (parsedUrl.pathname?.startsWith('/_internal/')) {
-      const providedToken = req.headers['x-internal-token'];
-      if (providedToken !== process.env.INTERNAL_ACCESS_TOKEN) {
-        log.warn({ ip: req.socket.remoteAddress, path: parsedUrl.pathname }, 'Blocked unauthorized internal access');
+      const remoteIp = req.socket.remoteAddress || '';
+      const isLoopback = remoteIp === '127.0.0.1' || remoteIp === '::1' || remoteIp === '::ffff:127.0.0.1';
+      const providedToken = String(req.headers['x-internal-token'] || '');
+      const expectedToken = process.env.INTERNAL_ACCESS_TOKEN || '';
+      const tokenBuf = Buffer.from(providedToken, 'utf-8');
+      const expectedBuf = Buffer.from(expectedToken, 'utf-8');
+      const tokenMatches =
+        expectedBuf.length > 0 &&
+        tokenBuf.length === expectedBuf.length &&
+        crypto.timingSafeEqual(tokenBuf, expectedBuf);
+      if (!isLoopback || !tokenMatches) {
+        log.warn({ ip: remoteIp, path: parsedUrl.pathname }, 'Blocked unauthorized internal access');
         res.writeHead(403, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Forbidden IP access' }));
         return;
@@ -82,15 +91,15 @@ async function ensureBridge() {
           const params = JSON.parse(body);
           const feishuBot = await import('./src/lib/feishu/bot');
           if (params.action === 'upsert') {
-            feishuBot.stopWorkspaceBotClient(params.workspaceUri);
+            feishuBot.stopWorkspaceBotClient(params.appId || params.workspaceUri);
             if (params.enabled) {
               const r = await feishuBot.startWorkspaceBotClient(params.config);
-              res.writeHead(r.success ? 200 : 400);
+              res.writeHead(r.success ? 200 : 400, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify(r));
               return;
             }
           } else if (params.action === 'delete') {
-            feishuBot.stopWorkspaceBotClient(params.workspaceUri);
+            feishuBot.stopWorkspaceBotClient(params.appId || params.workspaceUri);
           }
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ success: true }));

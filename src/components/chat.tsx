@@ -352,7 +352,7 @@ function StepBubble({ step, originalIndex, totalSteps, allSteps, isFastMode, onP
                         // Proxy local file paths through /api/file
                         if (m.uri.startsWith('file://')) {
                           src = `/api/file?path=${encodeURIComponent(m.uri.replace('file://', ''))}`;
-                        } else if (m.uri.startsWith('/')) {
+                        } else if (m.uri.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(m.uri)) {
                           src = `/api/file?path=${encodeURIComponent(m.uri)}`;
                         } else {
                           src = m.uri;

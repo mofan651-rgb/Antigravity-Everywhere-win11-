@@ -41,6 +41,17 @@ function decodeWorkspaceId(wsId: string): string | undefined {
   let resolvedPath = '/';
   let i = 0;
 
+  // Windows drive root: file_c_3A_Users_... or file_c_Users_...
+  if (
+    parts.length >= 2 &&
+    /^[a-zA-Z]$/.test(parts[0]) &&
+    (parts[1].toLowerCase() === '3a' ||
+      (process.platform === 'win32' && existsSync(`${parts[0].toUpperCase()}:/`)))
+  ) {
+    resolvedPath = `${parts[0].toLowerCase()}:/`;
+    i = parts[1].toLowerCase() === '3a' ? 2 : 1;
+  }
+
   while (i < parts.length) {
     let found = false;
 
@@ -78,7 +89,8 @@ function decodeWorkspaceId(wsId: string): string | undefined {
     }
   }
 
-  return 'file://' + resolvedPath.replace(/\/$/, '');
+  const normalized = resolvedPath.replace(/\/$/, '');
+  return normalized.startsWith('/') ? `file://${normalized}` : `file:///${normalized}`;
 }
 
 function probeHttpsPort(port: number, csrf: string): Promise<boolean> {
@@ -116,6 +128,7 @@ async function discoverWindowsServers(): Promise<LanguageServerInfo[]> {
   const servers: LanguageServerInfo[] = [];
   try {
     const psScript = [
+      '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8;',
       "$procs = Get-CimInstance Win32_Process -Filter \"Name='language_server.exe'\" | Where-Object { $_.CommandLine -match 'csrf_token' };",
       '$result = @();',
       'foreach ($p in $procs) {',

@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { homedir } from 'os';
+import { isSafeId, isPathInside } from '@/lib/bridge/path-utils';
 
 export const dynamic = 'force-dynamic';
 
@@ -9,7 +10,14 @@ const KNOWLEDGE_DIR = join(homedir(), '.gemini', 'antigravity', 'knowledge');
 
 export async function GET(_req: Request, { params }: { params: Promise<{ id: string; path: string[] }> }) {
   const { id, path } = await params;
-  const filePath = join(KNOWLEDGE_DIR, id, 'artifacts', ...path);
+  if (!isSafeId(id)) {
+    return NextResponse.json({ error: 'Invalid knowledge id' }, { status: 400 });
+  }
+  const artifactsDir = join(KNOWLEDGE_DIR, id, 'artifacts');
+  const filePath = join(artifactsDir, ...path);
+  if (!isPathInside(filePath, artifactsDir)) {
+    return NextResponse.json({ error: 'Invalid path' }, { status: 400 });
+  }
 
   if (!existsSync(filePath)) {
     return NextResponse.json({ error: 'Artifact not found' }, { status: 404 });
@@ -25,11 +33,14 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
 
 export async function PUT(req: Request, { params }: { params: Promise<{ id: string; path: string[] }> }) {
   const { id, path } = await params;
-  const filePath = join(KNOWLEDGE_DIR, id, 'artifacts', ...path);
+  if (!isSafeId(id)) {
+    return NextResponse.json({ error: 'Invalid knowledge id' }, { status: 400 });
+  }
+  const artifactsDir = join(KNOWLEDGE_DIR, id, 'artifacts');
+  const filePath = join(artifactsDir, ...path);
 
-  // Security: ensure the path doesn't escape the knowledge directory
-  const resolved = join(KNOWLEDGE_DIR, id, 'artifacts', ...path);
-  if (!resolved.startsWith(join(KNOWLEDGE_DIR, id))) {
+  // Security: ensure the path doesn't escape the knowledge artifacts directory
+  if (!isPathInside(filePath, artifactsDir)) {
     return NextResponse.json({ error: 'Invalid path' }, { status: 400 });
   }
 

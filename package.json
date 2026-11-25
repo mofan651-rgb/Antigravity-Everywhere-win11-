@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "tsx watch --exclude './data/**' server.ts",
     "build": "next build",
-    "start": "NODE_ENV=production tsx server.ts",
+    "start": "node scripts/start-prod.mjs",
     "lint": "eslint"
   },
   "dependencies": {

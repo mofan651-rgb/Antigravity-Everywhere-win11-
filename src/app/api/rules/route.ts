@@ -1,20 +1,12 @@
 import { NextResponse } from 'next/server';
 import { getAllConnections, getDynamicConversations, grpc, normalizeWorkspaceUri } from '@/lib/bridge/gateway';
+import { uriToFsPath, isPathInside, isSafeId } from '@/lib/bridge/path-utils';
 import fs, { existsSync, mkdirSync, copyFileSync, rmSync, writeFileSync } from 'fs';
 import { homedir } from 'os';
-import { exec } from 'child_process';
+import { execFile } from 'child_process';
 import path from 'path';
 
 export const dynamic = 'force-dynamic';
-
-function uriToFsPath(uriOrPath: string): string {
-  let p = uriOrPath.replace(/^file:\/\//, '');
-  try { p = decodeURIComponent(p); } catch {}
-  if (process.platform === 'win32' && /^\/[a-zA-Z]:/.test(p)) {
-    p = p.slice(1);
-  }
-  return p;
-}
 
 export async function GET() {
   try {
@@ -112,17 +104,51 @@ export async function GET() {
 }
 
 const openFileInEditor = (pathToOpen: string) => {
-  exec(`code "${pathToOpen}"`, (err: Error | null) => {
+  if (process.platform === 'win32') {
+    execFile(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-Command', 'if (Get-Command code -ErrorAction SilentlyContinue) { & code $env:AG_TARGET } else { Start-Process -FilePath $env:AG_TARGET }'],
+      { env: { ...process.env, AG_TARGET: pathToOpen } },
+      () => {}
+    );
+    return;
+  }
+  execFile('code', [pathToOpen], (err) => {
     if (!err) return;
-    if (process.platform === 'win32') {
-      exec(`cmd /c start "" "${pathToOpen}"`);
-    } else if (process.platform === 'darwin') {
-      exec(`open "${pathToOpen}"`);
-    } else {
-      exec(`xdg-open "${pathToOpen}"`);
-    }
+    execFile(process.platform === 'darwin' ? 'open' : 'xdg-open', [pathToOpen], () => {});
   });
 };
+
+async function getKnownWorkspaceRoots(): Promise<string[]> {
+  const roots = new Set<string>();
+  const conns = await getAllConnections().catch(() => []);
+  for (const conn of conns) {
+    if (conn.workspace) roots.add(uriToFsPath(conn.workspace));
+  }
+  const convs = await getDynamicConversations().catch(() => []);
+  for (const conv of convs) {
+    if (conv.workspace) roots.add(uriToFsPath(conv.workspace));
+  }
+  return [...roots];
+}
+
+async function isAllowedRulePath(targetPath: string): Promise<boolean> {
+  const globalDir = path.join(homedir(), '.agents', 'rules');
+  if (isPathInside(targetPath, globalDir)) return true;
+  if (path.resolve(targetPath) === path.resolve(path.join(homedir(), '.agents', 'rules.md'))) return true;
+  const wsRoots = await getKnownWorkspaceRoots();
+  for (const wsPath of wsRoots) {
+    if (
+      isPathInside(targetPath, path.join(wsPath, '.agents', 'rules')) ||
+      path.resolve(targetPath) === path.resolve(path.join(wsPath, '.agents', 'rules.md')) ||
+      path.resolve(targetPath) === path.resolve(path.join(wsPath, '.cursorrules')) ||
+      path.resolve(targetPath) === path.resolve(path.join(wsPath, '.clinerules'))
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
 
 export async function POST(req: Request) {
   try {
@@ -134,11 +160,23 @@ export async function POST(req: Request) {
       if (!workspace || !name) throw new Error('Workspace and name are required');
 
       const wsPath = uriToFsPath(workspace);
+      if (!isPathInside(wsPath, homedir())) {
+        const wsRoots = await getKnownWorkspaceRoots();
+        if (!wsRoots.some(r => isPathInside(wsPath, r))) {
+          return NextResponse.json({ error: 'Forbidden workspace path' }, { status: 403 });
+        }
+      }
       const rulesDir = path.join(wsPath, '.agents', 'rules');
       if (!existsSync(rulesDir)) mkdirSync(rulesDir, { recursive: true });
 
       const safeName = name.replace(/[^a-zA-Z0-9_-]/g, '-').toLowerCase();
+      if (!safeName || !isSafeId(safeName)) {
+        return NextResponse.json({ error: 'Invalid rule name' }, { status: 400 });
+      }
       const filepath = path.join(rulesDir, `${safeName}.md`);
+      if (!isPathInside(filepath, rulesDir)) {
+        return NextResponse.json({ error: 'Invalid rule path' }, { status: 400 });
+      }
       if (existsSync(filepath)) throw new Error('Rule already exists');
 
       const content = `---
@@ -159,6 +197,9 @@ Write your custom rule guidelines here...
     if (action === 'open') {
       const filepath = body.filepath ? uriToFsPath(body.filepath) : '';
       if (!filepath || !existsSync(filepath)) throw new Error('File not found at: ' + filepath);
+      if (!(await isAllowedRulePath(filepath))) {
+        return NextResponse.json({ error: 'Forbidden rule path' }, { status: 403 });
+      }
       openFileInEditor(filepath);
       return NextResponse.json({ success: true });
     }
@@ -166,11 +207,17 @@ Write your custom rule guidelines here...
     if (action === 'promote') {
       const filepath = body.filepath ? uriToFsPath(body.filepath) : '';
       if (!filepath || !existsSync(filepath)) throw new Error('File not found at: ' + filepath);
+      if (!(await isAllowedRulePath(filepath))) {
+        return NextResponse.json({ error: 'Forbidden rule path' }, { status: 403 });
+      }
 
       const globalDir = path.join(homedir(), '.agents', 'rules');
       if (!existsSync(globalDir)) mkdirSync(globalDir, { recursive: true });
 
       const filename = path.basename(filepath);
+      if (!isSafeId(filename)) {
+        return NextResponse.json({ error: 'Invalid rule filename' }, { status: 400 });
+      }
       const destPath = path.join(globalDir, filename);
 
       copyFileSync(filepath, destPath);
@@ -182,6 +229,9 @@ Write your custom rule guidelines here...
     if (action === 'delete') {
       const filepath = body.filepath ? uriToFsPath(body.filepath) : '';
       if (!filepath || !existsSync(filepath)) throw new Error('File not found at: ' + filepath);
+      if (!(await isAllowedRulePath(filepath))) {
+        return NextResponse.json({ error: 'Forbidden rule path' }, { status: 403 });
+      }
       rmSync(filepath);
       return NextResponse.json({ success: true });
     }

@@ -56,17 +56,19 @@ export async function POST(req: Request) {
     if (!pgServer) {
       log.info('No Playground server found, auto-launching...');
       try {
-        const { execSync } = require('child_process');
+        const { spawn } = require('child_process');
         const { existsSync } = require('fs');
         const ANTIGRAVITY_CLI = process.platform === 'win32'
           ? (existsSync(path.join(process.env.LOCALAPPDATA || '', 'Programs', 'antigravity', 'Antigravity.exe'))
               ? path.join(process.env.LOCALAPPDATA || '', 'Programs', 'antigravity', 'Antigravity.exe')
               : 'antigravity')
           : '/Applications/Antigravity.app/Contents/Resources/app/bin/antigravity';
-        execSync(`"${ANTIGRAVITY_CLI}" --new-window "${PLAYGROUND_DIR_PATH}"`, {
-          timeout: 5000,
+        const child = spawn(ANTIGRAVITY_CLI, ['--new-window', PLAYGROUND_DIR_PATH], {
+          detached: true,
           stdio: 'ignore',
+          shell: process.platform === 'win32' && !ANTIGRAVITY_CLI.endsWith('.exe'),
         });
+        child.unref();
         
         // Wait up to 5 seconds for the language server to register
         let retries = 10;

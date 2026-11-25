@@ -1,7 +1,8 @@
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import { homedir } from 'os';
 import path from 'path';
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync } from 'fs';
+import { atomicWriteFileSync, uriToFsPath } from './path-utils';
 
 const STATE_DB_PATH = process.platform === 'win32'
   ? path.join(process.env.APPDATA || path.join(homedir(), 'AppData', 'Roaming'), 'Antigravity/User/globalStorage/state.vscdb')
@@ -22,7 +23,7 @@ export function setGlobalModel(model: string) {
     mkdirSync(LOCAL_CACHE_DIR, { recursive: true });
     let existing = {};
     try { existing = JSON.parse(readFileSync(GLOBAL_SETTINGS_FILE, 'utf-8')); } catch {}
-    writeFileSync(GLOBAL_SETTINGS_FILE, JSON.stringify({ ...existing, preferredModel: model }, null, 2));
+    atomicWriteFileSync(GLOBAL_SETTINGS_FILE, JSON.stringify({ ...existing, preferredModel: model }, null, 2));
   } catch {}
 }
 
@@ -130,10 +131,10 @@ export function readConversationSummariesDb(): SummaryDbEntry[] {
 
   for (const pyBin of process.platform === 'win32' ? ['python', 'python3'] : ['python3', 'python']) {
     try {
-      const { execFileSync } = eval('require')('child_process');
       const output = execFileSync(pyBin, ['-c', pyScript, SUMMARIES_DB_PATH], {
         encoding: 'utf-8',
         timeout: 5000,
+        env: { ...process.env, PYTHONUTF8: '1' },
       });
       return mapRows(JSON.parse(output.trim() || '[]'));
     } catch {}
@@ -154,7 +155,7 @@ export function readLocalCache(): ConversationInfo[] {
 function writeLocalCache(convs: ConversationInfo[]) {
   try {
     mkdirSync(LOCAL_CACHE_DIR, { recursive: true });
-    writeFileSync(LOCAL_CACHE_FILE, JSON.stringify(convs, null, 2));
+    atomicWriteFileSync(LOCAL_CACHE_FILE, JSON.stringify(convs, null, 2));
   } catch {}
 }
 
@@ -185,10 +186,27 @@ export function updateLocalConversationTitle(id: string, title: string) {
 
 function queryDb(sql: string): string {
   if (!existsSync(STATE_DB_PATH)) return '';
+  // Prefer Python sqlite3 module so Windows hosts without sqlite3.exe work reliably
+  const pyQuery = [
+    'import sqlite3, sys',
+    'conn = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)',
+    'rows = conn.execute(sys.argv[2]).fetchall()',
+    'conn.close()',
+    'print("\\n".join(str(r[0]) for r in rows if r and r[0] is not None))',
+  ].join('\n');
+  for (const pyBin of process.platform === 'win32' ? ['python', 'python3'] : ['python3', 'python']) {
+    try {
+      return execFileSync(pyBin, ['-c', pyQuery, STATE_DB_PATH, sql], {
+        encoding: 'utf-8',
+        timeout: 5000,
+        env: { ...process.env, PYTHONUTF8: '1' },
+      }).trim();
+    } catch {}
+  }
   try {
-    return execSync(`sqlite3 "${STATE_DB_PATH}" "${sql}"`, {
+    return execFileSync('sqlite3', [STATE_DB_PATH, sql], {
       encoding: 'utf-8',
-      timeout: 5000
+      timeout: 5000,
     }).trim();
   } catch {
     return '';
@@ -215,20 +233,15 @@ export function getWorkspaces(): Array<{ type: 'folder' | 'workspace'; uri: stri
   if (!raw) return [];
   try {
     const data = JSON.parse(raw);
-    const { existsSync } = require('fs');
     return (data.entries || []).map((e: any) => {
-      if (e.folderUri) return { type: 'folder' as const, uri: e.folderUri };
-      if (e.workspace) return { type: 'workspace' as const, uri: e.workspace.configPath };
+      if (e.folderUri) return { type: 'folder' as const, uri: normalizeWorkspaceUri(e.folderUri) };
+      if (e.workspace) return { type: 'workspace' as const, uri: normalizeWorkspaceUri(e.workspace.configPath) };
       return null;
     }).filter((entry: any) => {
       if (!entry) return false;
       // Check if the directory still exists on disk
       try {
-        let fsPath = decodeURIComponent(entry.uri.replace(/^file:\/\//, ''));
-        if (process.platform === 'win32' && /^\/[a-zA-Z]:/.test(fsPath)) {
-          fsPath = fsPath.slice(1);
-        }
-        return existsSync(fsPath);
+        return existsSync(uriToFsPath(entry.uri));
       } catch {
         return false;
       }
@@ -446,10 +459,10 @@ db.close()
 print(json.dumps(result, ensure_ascii=False))
 `;
     const pyBin = process.platform === 'win32' ? 'python' : 'python3';
-    const { execFileSync } = eval('require')('child_process');
     const output = execFileSync(pyBin, ['-c', script, STATE_DB_PATH], {
       encoding: 'utf-8',
-      timeout: 15000
+      timeout: 15000,
+      env: { ...process.env, PYTHONUTF8: '1' },
     });
     return JSON.parse(output.trim());
   } catch {

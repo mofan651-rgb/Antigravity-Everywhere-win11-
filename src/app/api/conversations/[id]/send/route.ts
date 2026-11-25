@@ -1,5 +1,8 @@
 import { NextResponse } from 'next/server';
+import path from 'path';
+import { pathToFileURL } from 'url';
 import { getOwnerConnection, refreshOwnerMap, convOwnerMap, ownerMapAge, grpc } from '@/lib/bridge/gateway';
+import { uriToFsPath } from '@/lib/bridge/path-utils';
 import { createLogger } from '@/lib/logger';
 
 const log = createLogger('SendMsg');
@@ -51,7 +54,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     log.error({ err: (e as Error).message }, 'Failed to resolve global agents in send interceptor');
   }
 
-  let workspacePath = conn.workspace?.replace(/^file:\/\//, '') || process.cwd();
+  const workspacePath = conn.workspace ? path.resolve(uriToFsPath(conn.workspace)) : process.cwd();
 
   while ((match = fileRegex.exec(originalText)) !== null) {
     // Push text before the match
@@ -60,7 +63,10 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     }
 
     const rawPath = match[1];
-    let absoluteUri = rawPath.startsWith('/') ? `file://${rawPath}` : `file://${workspacePath}/${rawPath}`;
+    const resolvedFilePath = path.isAbsolute(rawPath)
+      ? path.resolve(rawPath)
+      : path.resolve(workspacePath, rawPath);
+    const absoluteUri = pathToFileURL(resolvedFilePath).href;
     
     // We omit workspaceUrisToRelativePaths because absoluteUri is sufficient 
     // for the Gateway to resolve the file reference in most setups.

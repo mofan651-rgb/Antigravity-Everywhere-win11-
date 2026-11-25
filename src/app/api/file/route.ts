@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { readFileSync, existsSync } from 'fs';
 import path from 'path';
 import os from 'os';
+import { uriToFsPath, isPathInside } from '@/lib/bridge/path-utils';
 
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
@@ -11,22 +12,14 @@ export async function GET(req: Request) {
     return NextResponse.json({ error: 'Missing path parameter' }, { status: 400 });
   }
   
-  let absolutePath = pathParam.replace(/^file:\/\//, '');
-  try { absolutePath = decodeURIComponent(absolutePath); } catch {}
-  if (process.platform === 'win32' && /^\/[a-zA-Z]:/.test(absolutePath)) {
-    absolutePath = absolutePath.slice(1);
-  }
+  let absolutePath = uriToFsPath(pathParam);
   
-  // Security Fix: Prevent Local File Inclusion (LFI) / Path Traversal
+  // Security Fix: Prevent Local File Inclusion (LFI) / Path Traversal / symlink escape
   try {
     absolutePath = path.resolve(absolutePath); // Resolve to absolute path, neutralizing ../
     
     const homeDir = path.resolve(os.homedir());
-    const isUnderHome = process.platform === 'win32'
-      ? absolutePath.toLowerCase().startsWith(homeDir.toLowerCase())
-      : absolutePath.startsWith(homeDir);
-    // Allow access to the user's home directory (since AI might edit files anywhere in home)
-    if (!isUnderHome) {
+    if (!isPathInside(absolutePath, homeDir)) {
       console.warn(`[Security] Blocked unauthorized file access: ${absolutePath}`);
       return NextResponse.json({ error: 'Forbidden path access' }, { status: 403 });
     }

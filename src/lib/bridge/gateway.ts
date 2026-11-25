@@ -287,7 +287,7 @@ export async function refreshOwnerMap() {
           .map((w: any) => w.workspaceFolderAbsoluteUri || '')
           .filter(Boolean);
           
-        const ownerWorkspace = convWorkspaces[0]?.replace('file://', '');
+        const ownerWorkspace = convWorkspaces[0] ? normalizeWorkspaceUri(convWorkspaces[0]) : undefined;
         const ownerEntry: OwnerInfo = { port: conn.port, csrf: conn.csrf, apiKey: conn.apiKey, stepCount: steps, workspace: ownerWorkspace };
 
         const matched = serverWs && convWorkspaces.some(ws => serverWs.includes(ws) || ws.includes(serverWs));

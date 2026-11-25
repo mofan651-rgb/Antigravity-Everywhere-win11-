@@ -152,7 +152,7 @@ export default function Sidebar({ activeId, onSelect, onNew, onDeleted, open, on
 
   useEffect(() => {
     api.getFeishuConfig().then(data => {
-      setIsFeishuConfigured(!!(data.appId && data.appSecret));
+      setIsFeishuConfigured(!!(data.appId && (data.hasSecret || data.appSecret)));
     }).catch(() => setIsFeishuConfigured(false));
   }, [feishuConfigOpen]); // re-check when dialog closes
 

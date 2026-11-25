@@ -27,12 +27,17 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: '缺少工作区 URI' }, { status: 400 });
     }
 
+    const existing = appId ? workspaceBotStore.getByAppId(appId) : undefined;
+    const resolvedSecret = typeof appSecret === 'string' && appSecret.trim()
+      ? appSecret.trim()
+      : (existing?.appSecret || '');
+
     const botConfig = {
       workspaceUri,
       appId: appId || '',
-      appSecret: appSecret || '',
-      label: label || '',
-      preferredModel: preferredModel || undefined,
+      appSecret: resolvedSecret,
+      label: label !== undefined ? label : (existing?.label || ''),
+      preferredModel: preferredModel !== undefined ? (preferredModel || undefined) : existing?.preferredModel,
       enabled: enabled !== false // 默认启用
     };
 
@@ -47,7 +52,7 @@ export async function POST(req: Request) {
          const resp = await fetch(`http://127.0.0.1:${port}/_internal/feishu/restart_workspace`, {
             method: 'POST',
             headers: { 'x-internal-token': process.env.INTERNAL_ACCESS_TOKEN || '' },
-            body: JSON.stringify({ action: 'upsert', workspaceUri, enabled: true, config: botConfig })
+            body: JSON.stringify({ action: 'upsert', appId: botConfig.appId, workspaceUri, enabled: true, config: botConfig })
          });
          r = await resp.json();
       } catch (e: any) { r.error = e.message; }
@@ -61,7 +66,7 @@ export async function POST(req: Request) {
         await fetch(`http://127.0.0.1:${port}/_internal/feishu/restart_workspace`, {
            method: 'POST',
            headers: { 'x-internal-token': process.env.INTERNAL_ACCESS_TOKEN || '' },
-           body: JSON.stringify({ action: 'upsert', workspaceUri, enabled: false })
+           body: JSON.stringify({ action: 'upsert', appId: botConfig.appId, workspaceUri, enabled: false })
         });
       } catch {}
       return NextResponse.json({ ok: true, message: '配置已保存（未启用或凭证不完整）' });
@@ -94,7 +99,7 @@ export async function DELETE(req: Request) {
         await fetch(`http://127.0.0.1:${port}/_internal/feishu/restart_workspace`, {
            method: 'POST',
            headers: { 'x-internal-token': process.env.INTERNAL_ACCESS_TOKEN || '' },
-           body: JSON.stringify({ action: 'delete', workspaceUri: bot.workspaceUri })
+           body: JSON.stringify({ action: 'delete', appId, workspaceUri: bot.workspaceUri })
         });
       } catch (e) {}
     }

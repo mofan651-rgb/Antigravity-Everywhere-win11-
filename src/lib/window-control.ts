@@ -14,6 +14,7 @@ function getFolderName(workspaceUri: string): string {
  * gracefully instead of force-killing the process.
  */
 export async function closeAntigravityWindow(workspaceUri: string): Promise<boolean> {
+  if (process.platform !== 'darwin') return false;
   const folderName = getFolderName(workspaceUri);
   if (!folderName) return false;
 
@@ -58,6 +59,7 @@ end run
  * Uses AppleScript to minimize the Antigravity window matching the workspace name.
  */
 export async function minimizeAntigravityWindow(workspaceUri: string): Promise<boolean> {
+  if (process.platform !== 'darwin') return false;
   const folderName = getFolderName(workspaceUri);
   if (!folderName) return false;
 

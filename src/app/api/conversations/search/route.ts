@@ -36,59 +36,77 @@ export async function GET(req: Request) {
       return NextResponse.json({ success: true, results: summaryMatches });
     }
 
-    // Use child_process.execFile to safely pass user input as an argument.
-    // This prevents Command Injection (RCE) by completely avoiding a shell.
+    // Use child_process.execFile with `--` to prevent option injection;
+    // fall back to Node binary/text scan when `grep` is unavailable (e.g. Windows).
+    const snippets: Record<string, string[]> = {};
+    const qLower = q.toLowerCase();
+    const pushCleanSnippet = (id: string, rawText: string) => {
+      const cleanSnippet = rawText.replace(/[^\x20-\x7E\u4e00-\u9fa5]/g, ' ').replace(/\s+/g, ' ').trim();
+      if (cleanSnippet.length > 0 && cleanSnippet.toLowerCase().includes(qLower)) {
+        if (!snippets[id]) snippets[id] = [];
+        if (snippets[id].length >= 2) return;
+        const idx = cleanSnippet.toLowerCase().indexOf(qLower);
+        const start = Math.max(0, idx - 40);
+        const end = Math.min(cleanSnippet.length, idx + q.length + 40);
+        snippets[id].push((start > 0 ? '...' : '') + cleanSnippet.substring(start, end) + (end < cleanSnippet.length ? '...' : ''));
+      }
+    };
+
     let stdout = '';
+    let usedNodeFallback = false;
     try {
-      const { stdout: out } = await execFileAsync('grep', ['-a', '-i', '-H', '-m', '2', q, ...files], { 
+      const { stdout: out } = await execFileAsync('grep', ['-a', '-i', '-H', '-m', '2', '--', q, ...files], {
         cwd: convDir,
-        timeout: 5000 
+        timeout: 5000
       });
       stdout = out;
     } catch (err: any) {
-      // grep exits with 1 if no matches are found, which is fine.
       if (err.code === 1) {
         stdout = '';
+      } else if (err.code === 'ENOENT') {
+        usedNodeFallback = true;
       } else {
-        throw err;
+        usedNodeFallback = true;
       }
     }
 
-    if (!stdout.trim()) {
-      return NextResponse.json({ results: [] });
-    }
-
-    const lines = stdout.trim().split('\n');
     const matchedIds = new Set<string>();
-    const snippets: Record<string, string[]> = {};
-
-    for (const line of lines) {
-      if (!line) continue;
-      // Format is "filename.pb:matched text..." or "Binary file filename.pb matches" (if we forgot -a)
-      const separatorIdx = line.indexOf(':');
-      if (separatorIdx === -1) continue;
-      
-      const file = line.slice(0, separatorIdx);
-      const text = line.slice(separatorIdx + 1);
-      
-      if (!file.endsWith('.pb')) continue;
-      
-      const id = file.replace('.pb', '');
-      matchedIds.add(id);
-      
-      // Clean up the protobuf binary characters to make the snippet readable
-      const cleanSnippet = text.replace(/[^\x20-\x7E\u4e00-\u9fa5]/g, ' ').replace(/\s+/g, ' ').trim();
-      if (cleanSnippet.length > 0) {
-        if (!snippets[id]) snippets[id] = [];
-        // Only keep snippets that actually contain the query text (case-insensitive)
-        if (cleanSnippet.toLowerCase().includes(q.toLowerCase())) {
-           // highlight or truncate snippet
-           const idx = cleanSnippet.toLowerCase().indexOf(q.toLowerCase());
-           const start = Math.max(0, idx - 40);
-           const end = Math.min(cleanSnippet.length, idx + q.length + 40);
-           snippets[id].push((start > 0 ? '...' : '') + cleanSnippet.substring(start, end) + (end < cleanSnippet.length ? '...' : ''));
-        }
+    if (usedNodeFallback) {
+      for (const file of files) {
+        try {
+          const buf = fs.readFileSync(path.join(convDir, file));
+          const text = buf.toString('utf8');
+          const lower = text.toLowerCase();
+          let pos = lower.indexOf(qLower);
+          if (pos === -1) continue;
+          const id = file.replace('.pb', '');
+          matchedIds.add(id);
+          let count = 0;
+          while (pos !== -1 && count < 2) {
+            const slice = text.slice(Math.max(0, pos - 80), Math.min(text.length, pos + q.length + 80));
+            pushCleanSnippet(id, slice);
+            count++;
+            pos = lower.indexOf(qLower, pos + qLower.length);
+          }
+        } catch { /* skip unreadable file */ }
       }
+    } else if (stdout.trim()) {
+      const lines = stdout.trim().split('\n');
+      for (const line of lines) {
+        if (!line) continue;
+        const separatorIdx = line.indexOf(':');
+        if (separatorIdx === -1) continue;
+        const file = line.slice(0, separatorIdx);
+        const text = line.slice(separatorIdx + 1);
+        if (!file.endsWith('.pb')) continue;
+        const id = file.replace('.pb', '');
+        matchedIds.add(id);
+        pushCleanSnippet(id, text);
+      }
+    }
+
+    if (matchedIds.size === 0) {
+      return NextResponse.json({ results: [] });
     }
 
     return NextResponse.json({ 

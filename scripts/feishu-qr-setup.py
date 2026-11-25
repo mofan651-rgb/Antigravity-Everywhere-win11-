@@ -3,6 +3,7 @@
 import asyncio
 import io
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -49,26 +50,47 @@ async def main() -> None:
         },
     )
 
+    if not result or not result.get("client_id") or not result.get("client_secret"):
+        raise RuntimeError("扫码注册未返回有效的 App ID / App Secret。")
+
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(
-        json.dumps(
-            {
-                "appId": result["client_id"],
-                "appSecret": result["client_secret"],
-            },
-            indent=2,
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
+    existing: dict = {}
+    if CONFIG_PATH.exists():
+        try:
+            loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                existing = loaded
+        except Exception:
+            existing = {}
+
+    merged = {
+        **existing,
+        "appId": result["client_id"],
+        "appSecret": result["client_secret"],
+    }
+    tmp_path = CONFIG_PATH.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(merged, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp_path.replace(CONFIG_PATH)
+    if os.name != "nt":
+        try:
+            os.chmod(CONFIG_PATH, 0o600)
+        except OSError:
+            pass
 
     print("\n" + "=" * 60)
     print("[SUCCESS] 飞书机器人创建并配置成功！")
     print(f"  - App ID:   {result['client_id']}")
     print(f"  - 配置文件: {CONFIG_PATH}")
-    print("  - 下一步:   在 WebUI (http://localhost:3000) 左下角点击 ⚙️ → 保存并重启飞书连接，或重启 Gateway。")
+    print("  - 下一步:   在 WebUI (http://localhost:3000) 左下角点击「飞书机器人管理中心」→ 保存并重连。")
     print("=" * 60 + "\n")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n[CANCELLED] 已取消扫码配置。")
+        sys.exit(1)
+    except Exception as exc:
+        print(f"\n[ERROR] 飞书扫码配置失败: {exc}", file=sys.stderr)
+        sys.exit(1)

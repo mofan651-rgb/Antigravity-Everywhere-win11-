@@ -1,9 +1,10 @@
 import { NextResponse } from 'next/server';
-import { getAllConnections, grpc } from '@/lib/bridge/gateway';
+import { getAllConnections, getDynamicConversations, grpc } from '@/lib/bridge/gateway';
+import { uriToFsPath, isPathInside, isSafeId } from '@/lib/bridge/path-utils';
 import { existsSync, mkdirSync, copyFileSync, rmSync, writeFileSync } from 'fs';
 import { homedir } from 'os';
 import path from 'path';
-import { exec } from 'child_process';
+import { execFile } from 'child_process';
 
 export const dynamic = 'force-dynamic';
 
@@ -45,27 +46,39 @@ export async function GET() {
   }
 }
 
-function uriToFsPath(uriOrPath: string): string {
-  let p = uriOrPath.replace(/^file:\/\//, '');
-  try { p = decodeURIComponent(p); } catch {}
-  if (process.platform === 'win32' && /^\/[a-zA-Z]:/.test(p)) {
-    p = p.slice(1);
-  }
-  return p;
-}
-
 const openFileInEditor = (pathToOpen: string) => {
-  exec(`code "${pathToOpen}"`, (err: Error | null) => {
+  if (process.platform === 'win32') {
+    execFile(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-Command', 'if (Get-Command code -ErrorAction SilentlyContinue) { & code $env:AG_TARGET } else { Start-Process -FilePath $env:AG_TARGET }'],
+      { env: { ...process.env, AG_TARGET: pathToOpen } },
+      () => {}
+    );
+    return;
+  }
+  execFile('code', [pathToOpen], (err) => {
     if (!err) return;
-    if (process.platform === 'win32') {
-      exec(`cmd /c start "" "${pathToOpen}"`);
-    } else if (process.platform === 'darwin') {
-      exec(`open "${pathToOpen}"`);
-    } else {
-      exec(`xdg-open "${pathToOpen}"`);
-    }
+    execFile(process.platform === 'darwin' ? 'open' : 'xdg-open', [pathToOpen], () => {});
   });
 };
+
+async function isAllowedWorkflowPath(targetPath: string): Promise<boolean> {
+  const globalDir = path.join(homedir(), '.agents', 'workflows');
+  if (isPathInside(targetPath, globalDir)) return true;
+  const conns = await getAllConnections().catch(() => []);
+  for (const conn of conns) {
+    if (conn.workspace && isPathInside(targetPath, path.join(uriToFsPath(conn.workspace), '.agents', 'workflows'))) {
+      return true;
+    }
+  }
+  const convs = await getDynamicConversations().catch(() => []);
+  for (const conv of convs) {
+    if (conv.workspace && isPathInside(targetPath, path.join(uriToFsPath(conv.workspace), '.agents', 'workflows'))) {
+      return true;
+    }
+  }
+  return false;
+}
 
 export async function POST(req: Request) {
   try {
@@ -75,12 +88,24 @@ export async function POST(req: Request) {
     if (action === 'create') {
       const { workspace, name, description } = body;
       if (!workspace || !name) throw new Error('Workspace and name are required');
+      if (!isSafeId(name)) {
+        return NextResponse.json({ error: 'Invalid workflow name' }, { status: 400 });
+      }
 
       const wsPath = uriToFsPath(workspace);
+      if (!isPathInside(wsPath, homedir())) {
+        const conns = await getAllConnections().catch(() => []);
+        if (!conns.some(c => c.workspace && isPathInside(wsPath, uriToFsPath(c.workspace)))) {
+          return NextResponse.json({ error: 'Forbidden workspace path' }, { status: 403 });
+        }
+      }
       const workflowsDir = path.join(wsPath, '.agents', 'workflows');
       if (!existsSync(workflowsDir)) mkdirSync(workflowsDir, { recursive: true });
 
       const filepath = path.join(workflowsDir, `${name}.md`);
+      if (!isPathInside(filepath, workflowsDir)) {
+        return NextResponse.json({ error: 'Invalid workflow path' }, { status: 400 });
+      }
       if (existsSync(filepath)) throw new Error('Workflow already exists');
 
       const content = `---
@@ -101,6 +126,9 @@ Write your workflow steps here...
     if (action === 'open') {
       const filepath = body.filepath ? uriToFsPath(body.filepath) : '';
       if (!filepath || !existsSync(filepath)) throw new Error('File not found at: ' + filepath);
+      if (!(await isAllowedWorkflowPath(filepath))) {
+        return NextResponse.json({ error: 'Forbidden workflow path' }, { status: 403 });
+      }
       openFileInEditor(filepath);
       return NextResponse.json({ success: true });
     }
@@ -108,11 +136,17 @@ Write your workflow steps here...
     if (action === 'promote') {
       const filepath = body.filepath ? uriToFsPath(body.filepath) : '';
       if (!filepath || !existsSync(filepath)) throw new Error('File not found at: ' + filepath);
+      if (!(await isAllowedWorkflowPath(filepath))) {
+        return NextResponse.json({ error: 'Forbidden workflow path' }, { status: 403 });
+      }
 
       const globalDir = path.join(homedir(), '.agents', 'workflows');
       if (!existsSync(globalDir)) mkdirSync(globalDir, { recursive: true });
 
       const filename = path.basename(filepath);
+      if (!isSafeId(filename)) {
+        return NextResponse.json({ error: 'Invalid workflow filename' }, { status: 400 });
+      }
       const destPath = path.join(globalDir, filename);
 
       copyFileSync(filepath, destPath);
@@ -124,6 +158,9 @@ Write your workflow steps here...
     if (action === 'delete') {
       const filepath = body.filepath ? uriToFsPath(body.filepath) : '';
       if (!filepath || !existsSync(filepath)) throw new Error('File not found at: ' + filepath);
+      if (!(await isAllowedWorkflowPath(filepath))) {
+        return NextResponse.json({ error: 'Forbidden workflow path' }, { status: 403 });
+      }
       rmSync(filepath);
       return NextResponse.json({ success: true });
     }

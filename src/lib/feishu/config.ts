@@ -1,9 +1,20 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+import { readFileSync, existsSync, mkdirSync, copyFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { homedir } from 'os';
+import { atomicWriteFileSync } from '@/lib/bridge/path-utils';
 
 const CONFIG_PATH = join(homedir(), '.gemini', 'antigravity', 'feishu-config.json');
 const WS_BOT_DIR = join(homedir(), '.gemini', 'antigravity', 'workspace-bots');
+
+function backupCorruptJson(filePath: string) {
+  try {
+    if (existsSync(filePath)) {
+      const backup = `${filePath}.corrupt-${Date.now()}`;
+      copyFileSync(filePath, backup);
+      console.error(`[FeishuConfig] Backed up corrupt config to ${backup}`);
+    }
+  } catch {}
+}
 
 export interface FeishuConfig {
   appId: string;
@@ -26,17 +37,19 @@ export interface AllBotsConfig {
 // --- Global config (backward compat) ---
 export const feishuConfigStore = {
   get(): FeishuConfig {
+    if (!existsSync(CONFIG_PATH)) {
+      return { appId: '', appSecret: '', showThoughts: false };
+    }
     try {
-      if (!existsSync(CONFIG_PATH)) {
-        return { appId: '', appSecret: '', showThoughts: false };
-      }
       const parsed = JSON.parse(readFileSync(CONFIG_PATH, 'utf-8'));
       return {
         appId: parsed.appId || '',
         appSecret: parsed.appSecret || '',
         showThoughts: Boolean(parsed.showThoughts),
       };
-    } catch {
+    } catch (e) {
+      console.error('Failed to parse feishu config', e);
+      backupCorruptJson(CONFIG_PATH);
       return { appId: '', appSecret: '', showThoughts: false };
     }
   },
@@ -50,7 +63,7 @@ export const feishuConfigStore = {
         appSecret: config.appSecret ?? prev.appSecret,
         showThoughts: config.showThoughts !== undefined ? Boolean(config.showThoughts) : Boolean(prev.showThoughts),
       };
-      writeFileSync(CONFIG_PATH, JSON.stringify(next, null, 2), 'utf-8');
+      atomicWriteFileSync(CONFIG_PATH, JSON.stringify(next, null, 2));
     } catch (e) {
       console.error('Failed to save feishu config', e);
     }
@@ -65,11 +78,13 @@ function getWsBotsPath() {
 export const workspaceBotStore = {
   /** Get all workspace bot configs */
   getAll(): WorkspaceBotConfig[] {
+    const p = getWsBotsPath();
+    if (!existsSync(p)) return [];
     try {
-      const p = getWsBotsPath();
-      if (!existsSync(p)) return [];
       return JSON.parse(readFileSync(p, 'utf-8'));
-    } catch {
+    } catch (e) {
+      console.error('Failed to parse workspace bots config', e);
+      backupCorruptJson(p);
       return [];
     }
   },
@@ -78,7 +93,7 @@ export const workspaceBotStore = {
   saveAll(bots: WorkspaceBotConfig[]) {
     try {
       mkdirSync(WS_BOT_DIR, { recursive: true });
-      writeFileSync(getWsBotsPath(), JSON.stringify(bots, null, 2), 'utf-8');
+      atomicWriteFileSync(getWsBotsPath(), JSON.stringify(bots, null, 2));
     } catch (e) {
       console.error('Failed to save workspace bots', e);
     }

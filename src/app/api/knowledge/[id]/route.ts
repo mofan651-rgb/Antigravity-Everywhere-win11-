@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { readFileSync, writeFileSync, rmSync, existsSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
+import { isSafeId, isPathInside } from '@/lib/bridge/path-utils';
 
 export const dynamic = 'force-dynamic';
 
@@ -24,7 +25,13 @@ function listArtifactFiles(artifactsDir: string, base = ''): string[] {
 
 export async function GET(_req: Request, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
+  if (!isSafeId(id)) {
+    return NextResponse.json({ error: 'Invalid knowledge id' }, { status: 400 });
+  }
   const kiDir = join(KNOWLEDGE_DIR, id);
+  if (!isPathInside(kiDir, KNOWLEDGE_DIR)) {
+    return NextResponse.json({ error: 'Invalid path' }, { status: 400 });
+  }
   const metaPath = join(kiDir, 'metadata.json');
 
   if (!existsSync(metaPath)) {
@@ -65,7 +72,13 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
 
 export async function PUT(req: Request, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
+  if (!isSafeId(id)) {
+    return NextResponse.json({ error: 'Invalid knowledge id' }, { status: 400 });
+  }
   const kiDir = join(KNOWLEDGE_DIR, id);
+  if (!isPathInside(kiDir, KNOWLEDGE_DIR)) {
+    return NextResponse.json({ error: 'Invalid path' }, { status: 400 });
+  }
   const metaPath = join(kiDir, 'metadata.json');
 
   if (!existsSync(metaPath)) {
@@ -100,7 +113,13 @@ export async function PUT(req: Request, { params }: { params: Promise<{ id: stri
 
 export async function DELETE(_req: Request, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
+  if (!isSafeId(id)) {
+    return NextResponse.json({ error: 'Invalid knowledge id' }, { status: 400 });
+  }
   const kiDir = join(KNOWLEDGE_DIR, id);
+  if (!isPathInside(kiDir, KNOWLEDGE_DIR)) {
+    return NextResponse.json({ error: 'Invalid path' }, { status: 400 });
+  }
 
   if (!existsSync(kiDir)) {
     return NextResponse.json({ error: 'Knowledge item not found' }, { status: 404 });

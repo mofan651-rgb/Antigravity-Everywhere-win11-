@@ -6,8 +6,12 @@ export const dynamic = 'force-dynamic';
 
 export async function GET() {
   const config = feishuConfigStore.get();
-  // Don't mask secrets here since it's a local CLI tool and the user needs to see/edit them.
-  return NextResponse.json(config);
+  return NextResponse.json({
+    appId: config.appId || '',
+    appSecret: '',
+    hasSecret: Boolean(config.appSecret),
+    showThoughts: Boolean(config.showThoughts),
+  });
 }
 
 export async function POST(req: Request) {
@@ -15,7 +19,8 @@ export async function POST(req: Request) {
     const config = await req.json();
     const prev = feishuConfigStore.get();
     const nextAppId = config.appId !== undefined ? (config.appId || '') : prev.appId;
-    const nextAppSecret = config.appSecret !== undefined ? (config.appSecret || '') : prev.appSecret;
+    const providedSecret = typeof config.appSecret === 'string' ? config.appSecret.trim() : '';
+    const nextAppSecret = providedSecret ? providedSecret : prev.appSecret;
     const nextShowThoughts = config.showThoughts !== undefined ? Boolean(config.showThoughts) : Boolean(prev.showThoughts);
 
     feishuConfigStore.set({

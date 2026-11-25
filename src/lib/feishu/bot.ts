@@ -8,7 +8,66 @@ import { getWorkspaces, getConversations, addLocalConversation, getGlobalModel, 
 import { discoverLanguageServers } from '@/lib/bridge/discovery';
 
 const _feishuAppClients = new Map<string, lark.Client>();
-const processedMsgIds = new Set<string>();
+const processedMsgIds = new Map<string, number>();
+const MSG_DEDUP_TTL_MS = 10 * 60 * 1000;
+const MAX_CARD_BYTES = 24000;
+
+function markMessageProcessed(msgId?: string): boolean {
+  if (!msgId) return false;
+  const now = Date.now();
+  const prev = processedMsgIds.get(msgId);
+  if (prev && now - prev < MSG_DEDUP_TTL_MS) return true;
+  processedMsgIds.set(msgId, now);
+  if (processedMsgIds.size > 2000) {
+    for (const [k, ts] of processedMsgIds) {
+      if (now - ts >= MSG_DEDUP_TTL_MS || processedMsgIds.size > 1500) {
+        processedMsgIds.delete(k);
+      } else {
+        break;
+      }
+    }
+  }
+  return false;
+}
+
+function truncateForFeishuCard(text: string): string {
+  if (Buffer.byteLength(text, 'utf8') <= MAX_CARD_BYTES) return text;
+  const suffix = '\n\n...(内容过长，已截断显示)';
+  const limit = MAX_CARD_BYTES - Buffer.byteLength(suffix, 'utf8');
+  let lo = 0;
+  let hi = text.length;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (Buffer.byteLength(text.slice(0, mid), 'utf8') <= limit) lo = mid;
+    else hi = mid - 1;
+  }
+  return text.slice(0, lo) + suffix;
+}
+
+function findTargetServer(servers: Awaited<ReturnType<typeof discoverLanguageServers>>, wsUri?: string) {
+  if (!wsUri) return servers.find(s => !s.workspace) || servers[0];
+  const normTarget = normalizeWorkspaceUri(wsUri);
+  const exactOrMatch = servers.find(s => {
+    if (!s.workspace) return false;
+    const normSrv = normalizeWorkspaceUri(s.workspace);
+    return normSrv === normTarget || normSrv.includes(normTarget) || normTarget.includes(normSrv);
+  });
+  return exactOrMatch || servers.find(s => !s.workspace);
+}
+
+function closeWsClientSafely(client: lark.WSClient | null | undefined) {
+  if (!client) return;
+  try {
+    const origProto = Object.getPrototypeOf(client);
+    if (typeof origProto?.close === 'function') {
+      try {
+        (client as any).close({ force: true });
+      } catch {
+        (client as any).close();
+      }
+    }
+  } catch {}
+}
 
 export function getAppClient(appId?: string, appSecret?: string): lark.Client {
   if (!appId || !appSecret) {
@@ -32,7 +91,7 @@ export function getAppClient(appId?: string, appSecret?: string): lark.Client {
 function buildCard(text: string) {
   return JSON.stringify({
     config: { wide_screen_mode: true },
-    elements: [{ tag: "markdown", content: text }]
+    elements: [{ tag: "markdown", content: truncateForFeishuCard(text) }]
   });
 }
 
@@ -55,16 +114,29 @@ export async function sendFeishuText(receiveId: string, text: string, appId?: st
 }
 
 async function updateFeishuText(messageId: string, text: string, appId?: string, appSecret?: string) {
-  try {
-    const res = await getAppClient(appId, appSecret).im.message.patch({
-      path: { message_id: messageId },
-      data: { content: buildCard(text) }
-    });
-    if (res.code && res.code !== 0) {
-      console.warn(`[FEISHU_PATCH_RES] ID=${messageId} -> HTTP ${res.code} ${res.msg}`);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const res = await getAppClient(appId, appSecret).im.message.patch({
+        path: { message_id: messageId },
+        data: { content: buildCard(text) }
+      });
+      if (res.code && res.code !== 0) {
+        console.warn(`[FEISHU_PATCH_RES] ID=${messageId} -> HTTP ${res.code} ${res.msg}`);
+        if ((res.code === 99991400 || res.code === 429) && attempt < 2) {
+          await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
+          continue;
+        }
+      }
+      return;
+    } catch (e: any) {
+      const status = e?.response?.status || e?.code;
+      if ((status === 429 || status === 99991400) && attempt < 2) {
+        await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
+        continue;
+      }
+      console.error(`[FEISHU_PATCH_EXCEPTION] ID=${messageId} ->`, e);
+      return;
     }
-  } catch (e) {
-    console.error(`[FEISHU_PATCH_EXCEPTION] ID=${messageId} ->`, e);
   }
 }
 
@@ -77,17 +149,19 @@ export async function broadcastFeishuMessage(text: string) {
     const session = storeData[openId];
     // Only broadcast to users who are interacting with the global bot, to prevent 'open_id cross app' error
     if (!session.botAppId || session.botAppId === config.appId) {
-      await sendFeishuText(openId, text);
+      try {
+        await sendFeishuText(openId, text);
+      } catch (e: any) {
+        console.warn(`[Feishu] Broadcast to ${openId.slice(0, 12)} failed:`, e?.message || e);
+      }
     }
   }
 }
 
 async function handleWorkspaceSelected(openId: string, wsUri: string) {
-  // Find the exact server connection instead of a random one
+  // Find the exact server connection instead of a random bound workspace
   const servers = await discoverLanguageServers();
-  const targetServer = servers.find(s => 
-    s.workspace?.includes(wsUri.replace('file://', '')) || wsUri.includes(s.workspace || '\0')
-  ) || servers[0];
+  const targetServer = findTargetServer(servers, wsUri);
   
   if (!targetServer) {
     await sendFeishuText(openId, '未找到该工作区的运行实例，请先启动对应的工作空间。');
@@ -195,13 +269,28 @@ export async function subscribeToAgent(cascadeId: string, feishuOpenId: string, 
   let replyMessageId: string | undefined;
   let fullSteps: any[] = [];
   let isThinking = true;
+  let isPatching = false;
+  let pendingPatch = false;
+  let flushedFinal = false;
 
-  // We immediately create a placeholder message in Feishu
-  sendFeishuText(feishuOpenId, '⏳ 思考中...', targetAppId, targetAppSecret)
-    .then(msgId => { replyMessageId = msgId; })
-    .catch(err => { console.warn('[Feishu] Placeholder send failed:', err?.message || err); });
+  // Immediately create a placeholder message in Feishu and retain its promise so terminal flushes never drop it
+  const placeholderPromise = sendFeishuText(feishuOpenId, '⏳ 思考中...', targetAppId, targetAppSecret)
+    .then(msgId => { replyMessageId = msgId; return msgId; })
+    .catch(err => {
+      console.warn('[Feishu] Placeholder send failed:', err?.message || err);
+      return undefined;
+    });
 
   const updateFeishu = async () => {
+    if (isPatching) {
+      pendingPatch = true;
+      return;
+    }
+    if (!replyMessageId) {
+      await placeholderPromise;
+    }
+    if (!replyMessageId) return;
+
     const showThoughts = Boolean(feishuConfigStore.get().showThoughts);
 
     // Find the latest user input so we don't repeat history
@@ -271,14 +360,23 @@ export async function subscribeToAgent(cascadeId: string, feishuOpenId: string, 
     }
     text = combined.trim();
 
-    if (!replyMessageId) return; // Wait for Feishu to allocate the bubble before discarding diffs!
     if (!text && isThinking) return;
-    if (text === lastSentText && isThinking) return;
+    if (text === lastSentText && (isThinking || flushedFinal)) return;
 
-    lastSentText = text;
-    const displayText = text || '等待输入...';
-    console.log(`[FEISHU_TEXT_PATCH] ID=${replyMessageId} text_len=${text.length} -> "${displayText.slice(0, 50)}..."`);
-    await updateFeishuText(replyMessageId, displayText + (isThinking ? ' ⏳' : ''), targetAppId, targetAppSecret);
+    isPatching = true;
+    try {
+      lastSentText = text;
+      if (!isThinking) flushedFinal = true;
+      const displayText = text || '等待输入...';
+      console.log(`[FEISHU_TEXT_PATCH] ID=${replyMessageId} text_len=${text.length} -> "${displayText.slice(0, 50)}..."`);
+      await updateFeishuText(replyMessageId, displayText + (isThinking ? ' ⏳' : ''), targetAppId, targetAppSecret);
+    } finally {
+      isPatching = false;
+      if (pendingPatch) {
+        pendingPatch = false;
+        void updateFeishu();
+      }
+    }
   };
 
   const timer = setInterval(() => { updateFeishu().catch(() => {}); }, 1500); // 1.5s interval to avoid Feishu rate limits
@@ -297,6 +395,20 @@ export async function subscribeToAgent(cascadeId: string, feishuOpenId: string, 
       resolveSub();
 
       const stepsUpdate = update?.mainTrajectoryUpdate?.stepsUpdate;
+      if (stepsUpdate?.steps?.length) {
+        const indices: number[] = stepsUpdate.indices || [];
+        const newSteps: any[] = stepsUpdate.steps || [];
+        const totalLength: number = stepsUpdate.totalLength || 0;
+
+        if (indices.length > 0 && indices.length === newSteps.length) {
+          if (totalLength > fullSteps.length) fullSteps.length = totalLength;
+          for (let i = 0; i < indices.length; i++) fullSteps[indices[i]] = newSteps[i];
+        } else if (newSteps.length >= fullSteps.length) {
+          fullSteps = [...newSteps];
+        }
+        console.log(`[STREAM_UPDATE] fullSteps len=${fullSteps.length}`);
+      }
+
       const status = update?.status || '';
       
       if (status !== 'CASCADE_RUN_STATUS_DONE' && status !== 'CASCADE_RUN_STATUS_IDLE') {
@@ -307,7 +419,7 @@ export async function subscribeToAgent(cascadeId: string, feishuOpenId: string, 
         if (isThinking) {
           isThinking = false;
           clearInterval(timer);
-          updateFeishu().catch(() => {});
+          void updateFeishu().catch(() => {});
           
           setTimeout(() => {
              if (status === 'CASCADE_RUN_STATUS_ERROR') {
@@ -321,20 +433,6 @@ export async function subscribeToAgent(cascadeId: string, feishuOpenId: string, 
              }
           }, 1000);
         }
-      }
-
-      if (stepsUpdate?.steps?.length) {
-        const indices: number[] = stepsUpdate.indices || [];
-        const newSteps: any[] = stepsUpdate.steps || [];
-        const totalLength: number = stepsUpdate.totalLength || 0;
-
-        if (indices.length > 0 && indices.length === newSteps.length) {
-          if (totalLength > fullSteps.length) fullSteps.length = totalLength;
-          for (let i = 0; i < indices.length; i++) fullSteps[indices[i]] = newSteps[i];
-        } else if (newSteps.length >= fullSteps.length) {
-          fullSteps = [...newSteps];
-        }
-        console.log(`[STREAM_UPDATE] fullSteps len=${fullSteps.length}`);
       }
     },
     (err: Error) => {
@@ -359,8 +457,9 @@ export async function subscribeToAgent(cascadeId: string, feishuOpenId: string, 
 
 let activeWSClient: lark.WSClient | null = null;
 
-// --- Workspace-specific WSClients ---
+// --- Workspace-specific WSClients keyed by appId ---
 const workspaceWSClients = new Map<string, lark.WSClient>();
+const workspaceWSLocks = new Map<string, Promise<unknown>>();
 
 export async function startFeishuClient(): Promise<{ success: boolean; error?: string }> {
   const config = feishuConfigStore.get();
@@ -372,12 +471,7 @@ export async function startFeishuClient(): Promise<{ success: boolean; error?: s
   // Start fresh and prevent zombie long-running sockets
   if (activeWSClient) {
     console.log('[Feishu] Discarding previous Global WSClient instance.');
-    try {
-      const origProto = Object.getPrototypeOf(activeWSClient);
-      if (typeof origProto.close === 'function') {
-        (activeWSClient as any).close();
-      }
-    } catch (err) {}
+    closeWsClientSafely(activeWSClient);
     activeWSClient = null;
   }
 
@@ -389,14 +483,12 @@ export async function startFeishuClient(): Promise<{ success: boolean; error?: s
 
     const eventDispatcher = new lark.EventDispatcher({}).register({
       'im.message.receive_v1': async (data: any) => {
+        const msgId = data?.message?.message_id;
+        if (markMessageProcessed(msgId)) return;
+
+        void (async () => {
         try {
         console.log('[FEISHU_RAW_EVENT_RECEIVED]', JSON.stringify(data).slice(0, 400));
-        const msgId = data?.message?.message_id;
-        if (msgId) {
-          if (processedMsgIds.has(msgId)) return;
-          processedMsgIds.add(msgId);
-          if (processedMsgIds.size > 2000) processedMsgIds.clear(); // max capacity
-        }
         const openId = (data?.sender?.sender_id as any)?.open_id;
         const unionId = (data?.sender?.sender_id as any)?.union_id;
     if (!openId) {
@@ -706,6 +798,7 @@ export async function startFeishuClient(): Promise<{ success: boolean; error?: s
                       await grpc.sendMessage(match.port, match.csrf, apiKey, newId, activationMsg);
                       await sendFeishuText(openId, `🚀 工作区已就绪！正在以 **${idx === 2 ? 'GSD' : 'Superpowers'}** 模式启动，请稍候...`);
                     } catch (actErr: any) {
+                      activeStreams.get(newId)?.();
                       console.warn('[Feishu] Mode activation message failed:', actErr.message);
                       await sendFeishuText(openId, `🚀 工作区已就绪并绑定会话！现在您可以直接发送问题，开始在 \`${projectName}\` 中干活了。`);
                     }
@@ -801,9 +894,7 @@ export async function startFeishuClient(): Promise<{ success: boolean; error?: s
       } else if (!isNaN(idx) && idx === hists.length) {
         await sendFeishuText(openId, `正在初始化新会话，请稍候...`);
         const servers = await discoverLanguageServers();
-        const targetServer = servers.find(s => 
-          s.workspace?.includes(wsUri!.replace('file://', '')) || wsUri!.includes(s.workspace || '\0')
-        ) || servers[0];
+        const targetServer = findTargetServer(servers, wsUri);
         
         if (!targetServer) {
           await sendFeishuText(openId, '未找到该工作区的运行实例。');
@@ -897,11 +988,13 @@ export async function startFeishuClient(): Promise<{ success: boolean; error?: s
       await subscribeToAgent(session.activeCascadeId, openId);
       await grpc.sendMessage(conn.port, conn.csrf, conn.apiKey, session.activeCascadeId, text, targetModel);
     } catch (e: any) {
+      activeStreams.get(session.activeCascadeId)?.();
       await sendFeishuText(openId, `发送失败: ${e.message}`);
     }
     } catch (globalErr: any) {
       console.error('[FEISHU_DISPATCH_GLOBAL_ERROR]', globalErr);
     }
+        })();
   } // ends the async (data) => function body
     }); // ends eventDispatcher.register({...});
 
@@ -932,165 +1025,170 @@ export async function startWorkspaceBotClient(botConfig: WorkspaceBotConfig): Pr
     return { success: false, error: '配置不完整或未启用' };
   }
 
-  // Stop existing client for this workspace safely
-  const existing = workspaceWSClients.get(botConfig.workspaceUri);
-  if (existing) {
-    console.log(`[Feishu] Discarding previous WSClient for workspace: ${botConfig.workspaceUri}`);
+  const prevLock = workspaceWSLocks.get(botConfig.appId) || Promise.resolve();
+  const runPromise = prevLock.catch(() => {}).then(async () => {
+    // Stop existing client for this appId safely
+    const existing = workspaceWSClients.get(botConfig.appId);
+    if (existing) {
+      console.log(`[Feishu] Discarding previous WSClient for appId: ${botConfig.appId}`);
+      closeWsClientSafely(existing);
+      workspaceWSClients.delete(botConfig.appId);
+    }
+
     try {
-      const origProto = Object.getPrototypeOf(existing);
-      if (typeof origProto.close === 'function') {
-        (existing as any).close();
-      }
-    } catch {}
-    workspaceWSClients.delete(botConfig.workspaceUri);
-  }
+      const wsClient = new lark.WSClient({
+        appId: botConfig.appId,
+        appSecret: botConfig.appSecret,
+      });
 
-  try {
-    const wsClient = new lark.WSClient({
-      appId: botConfig.appId,
-      appSecret: botConfig.appSecret,
-    });
+      const wsUri = botConfig.workspaceUri;
+      const wsLabel = botConfig.label || wsUri.split('/').pop() || wsUri;
 
-    const wsUri = botConfig.workspaceUri;
-    const wsLabel = botConfig.label || wsUri.split('/').pop() || wsUri;
+      const eventDispatcher = new lark.EventDispatcher({}).register({
+        'im.message.receive_v1': async (data: any) => {
+          const msgId = data?.message?.message_id;
+          if (markMessageProcessed(msgId)) return;
 
-    const eventDispatcher = new lark.EventDispatcher({}).register({
-      'im.message.receive_v1': async (data: any) => {
-        try {
-        console.error(`[FEISHU_WS_BOT] workspace=${wsLabel}`, JSON.stringify(data).slice(0, 300));
-        const msgId = data?.message?.message_id;
-        if (msgId) {
-          if (processedMsgIds.has(msgId)) return;
-          processedMsgIds.add(msgId);
-        }
-        const openId = (data?.sender?.sender_id as any)?.open_id;
-        if (!openId) return;
+          void (async () => {
+          try {
+          console.error(`[FEISHU_WS_BOT] workspace=${wsLabel}`, JSON.stringify(data).slice(0, 300));
+          const openId = (data?.sender?.sender_id as any)?.open_id;
+          if (!openId) return;
 
-        let text = '';
-        try {
-          if (data.message.message_type === 'text') {
-            text = JSON.parse(data.message.content).text;
+          let text = '';
+          try {
+            if (data.message.message_type === 'text') {
+              text = JSON.parse(data.message.content).text;
+            }
+          } catch {}
+          text = text.trim();
+
+          feishuStore.updateSession(openId, { state: 'idle', botAppId: botConfig.appId });
+
+          if (!text || text === '/help' || text === '?' || text === 'help') {
+            await sendFeishuText(openId,
+              `🤖 您好！我是 **${wsLabel}** 的专属机器人。\n\n` +
+              `💬 请直接发送指令或问题，我会专注于操作此工作区的代码与任务。\n` +
+              `💭 发送 \`/think\` 可开启/关闭显示 AI 思考过程。\n` +
+              `📁 绑定工作区: \`${wsUri.split('/').pop()}\``,
+              botConfig.appId, botConfig.appSecret
+            );
+            return;
           }
-        } catch {}
-        text = text.trim();
 
-        feishuStore.updateSession(openId, { state: 'idle', botAppId: botConfig.appId });
+          const lowerWsText = text.toLowerCase();
+          if (lowerWsText === '/think' || lowerWsText === '/thought' || lowerWsText === '/think on' || lowerWsText === '/think off') {
+            const prevCfg = feishuConfigStore.get();
+            const next = lowerWsText.endsWith(' on') ? true : lowerWsText.endsWith(' off') ? false : !Boolean(prevCfg.showThoughts);
+            feishuConfigStore.set({ ...prevCfg, showThoughts: next });
+            await sendFeishuText(
+              openId,
+              next ? '💭 已**开启**飞书端显示 AI 思考过程。' : '🙈 已**关闭**飞书端显示 AI 思考过程。',
+              botConfig.appId,
+              botConfig.appSecret
+            );
+            return;
+          }
 
-        if (!text || text === '/help' || text === '?' || text === 'help') {
-          await sendFeishuText(openId,
-            `🤖 您好！我是 **${wsLabel}** 的专属机器人。\n\n` +
-            `💬 请直接发送指令或问题，我会专注于操作此工作区的代码与任务。\n` +
-            `💭 发送 \`/think\` 可开启/关闭显示 AI 思考过程。\n` +
-            `📁 绑定工作区: \`${wsUri.split('/').pop()}\``,
-            botConfig.appId, botConfig.appSecret
-          );
-          return;
-        }
+          // Find the language server for this specific workspace
+          const servers = await discoverLanguageServers();
+          const targetServer = findTargetServer(servers, wsUri);
 
-        const lowerWsText = text.toLowerCase();
-        if (lowerWsText === '/think' || lowerWsText === '/thought' || lowerWsText === '/think on' || lowerWsText === '/think off') {
-          const prevCfg = feishuConfigStore.get();
-          const next = lowerWsText.endsWith(' on') ? true : lowerWsText.endsWith(' off') ? false : !Boolean(prevCfg.showThoughts);
-          feishuConfigStore.set({ ...prevCfg, showThoughts: next });
-          await sendFeishuText(
-            openId,
-            next ? '💭 已**开启**飞书端显示 AI 思考过程。' : '🙈 已**关闭**飞书端显示 AI 思考过程。',
-            botConfig.appId,
-            botConfig.appSecret
-          );
-          return;
-        }
+          if (!targetServer) {
+            await sendFeishuText(openId, '❌ 未找到该工作区的运行实例，请先启动对应的工作空间。', botConfig.appId, botConfig.appSecret);
+            return;
+          }
 
-        // Find the language server for this specific workspace
-        const servers = await discoverLanguageServers();
-        const targetServer = servers.find(s => 
-          s.workspace?.includes(wsUri.replace('file://', '')) || wsUri.includes(s.workspace || '\0')
-        ) || servers[0];
+          const session = feishuStore.getSession(openId);
+          let cascadeId = session.activeCascadeId;
 
-        if (!targetServer) {
-          await sendFeishuText(openId, '❌ 未找到该工作区的运行实例，请先启动对应的工作空间。', botConfig.appId, botConfig.appSecret);
-          return;
-        }
+          // If no active cascade, start a new one
+          if (!cascadeId) {
+            try {
+              const { getApiKey } = await import('@/lib/bridge/statedb');
+              const apiKey = getApiKey();
+              if (!apiKey) {
+                await sendFeishuText(openId, '❌ API Key 未找到。', botConfig.appId, botConfig.appSecret);
+                return;
+              }
+              const res = await grpc.startCascade(targetServer.port, targetServer.csrf, apiKey, wsUri);
+              cascadeId = res.cascadeId;
+              if (cascadeId) {
+                addLocalConversation(cascadeId, wsUri, `来自 ${wsLabel} 机器人`);
+                feishuStore.updateSession(openId, { state: 'idle', activeCascadeId: cascadeId });
+              }
+            } catch (e: any) {
+              await sendFeishuText(openId, `❌ 创建会话失败: ${e.message}`, botConfig.appId, botConfig.appSecret);
+              return;
+            }
+          }
 
-        const session = feishuStore.getSession(openId);
-        let cascadeId = session.activeCascadeId;
+          if (!cascadeId) return;
 
-        // If no active cascade or it belongs to a different workspace, start a new one
-        if (!cascadeId) {
           try {
             const { getApiKey } = await import('@/lib/bridge/statedb');
             const apiKey = getApiKey();
-            if (!apiKey) {
-              await sendFeishuText(openId, '❌ API Key 未找到。', botConfig.appId, botConfig.appSecret);
-              return;
-            }
-            const res = await grpc.startCascade(targetServer.port, targetServer.csrf, apiKey, wsUri);
-            cascadeId = res.cascadeId;
-            if (cascadeId) {
-              addLocalConversation(cascadeId, wsUri, `来自 ${wsLabel} 机器人`);
-              feishuStore.updateSession(openId, { state: 'idle', activeCascadeId: cascadeId });
-            }
-          } catch (e: any) {
-            await sendFeishuText(openId, `❌ 创建会话失败: ${e.message}`, botConfig.appId, botConfig.appSecret);
-            return;
-          }
-        }
-
-        if (!cascadeId) return;
-
-        try {
-          const { getApiKey } = await import('@/lib/bridge/statedb');
-          const apiKey = getApiKey();
-          let targetModel = botConfig.preferredModel || session.preferredModel || getGlobalModel() || 'MODEL_AUTO';
-          
-          if (targetModel === 'MODEL_AUTO') {
-            try {
-              const mData = await grpc.getModelConfigs(targetServer.port, targetServer.csrf, apiKey!);
-              if (mData?.clientModelConfigs?.length) {
-                const models = mData.clientModelConfigs;
-                const priority = ['MODEL_PLACEHOLDER_M26', 'MODEL_PLACEHOLDER_M37', 'MODEL_PLACEHOLDER_M36', 'MODEL_PLACEHOLDER_M35', 'MODEL_PLACEHOLDER_M47'];
-                let found = false;
-                for (const p of priority) {
-                  const conf = models.find((m: any) => m.modelOrAlias?.model === p);
-                  if (conf && conf.quotaInfo?.remainingFraction !== undefined && conf.quotaInfo.remainingFraction > 0) {
-                    targetModel = p;
-                    found = true;
-                    break;
+            let targetModel = botConfig.preferredModel || session.preferredModel || getGlobalModel() || 'MODEL_AUTO';
+            
+            if (targetModel === 'MODEL_AUTO') {
+              try {
+                const mData = await grpc.getModelConfigs(targetServer.port, targetServer.csrf, apiKey!);
+                if (mData?.clientModelConfigs?.length) {
+                  const models = mData.clientModelConfigs;
+                  const priority = ['MODEL_PLACEHOLDER_M26', 'MODEL_PLACEHOLDER_M37', 'MODEL_PLACEHOLDER_M36', 'MODEL_PLACEHOLDER_M35', 'MODEL_PLACEHOLDER_M47'];
+                  let found = false;
+                  for (const p of priority) {
+                    const conf = models.find((m: any) => m.modelOrAlias?.model === p);
+                    if (conf && conf.quotaInfo?.remainingFraction !== undefined && conf.quotaInfo.remainingFraction > 0) {
+                      targetModel = p;
+                      found = true;
+                      break;
+                    }
                   }
+                  if (!found) {
+                    targetModel = models.find((m: any) => m.modelOrAlias?.model === 'MODEL_PLACEHOLDER_M47')?.modelOrAlias?.model
+                                  || models[0]?.modelOrAlias?.model || 'MODEL_PLACEHOLDER_M26';
+                  }
+                } else {
+                  targetModel = 'MODEL_PLACEHOLDER_M26';
                 }
-                if (!found) {
-                  targetModel = models.find((m: any) => m.modelOrAlias?.model === 'MODEL_PLACEHOLDER_M47')?.modelOrAlias?.model
-                                || models[0]?.modelOrAlias?.model || 'MODEL_PLACEHOLDER_M26';
-                }
-              } else {
+              } catch (e) {
+                console.warn('[Feishu] Auto model resolution failed, fallback to M26', e);
                 targetModel = 'MODEL_PLACEHOLDER_M26';
               }
-            } catch (e) {
-              console.warn('[Feishu] Auto model resolution failed, fallback to M26', e);
-              targetModel = 'MODEL_PLACEHOLDER_M26';
             }
+            
+            // MUST subscribe BEFORE sending the message!
+            await subscribeToAgent(cascadeId, openId, botConfig.appId, botConfig.appSecret);
+            await grpc.sendMessage(targetServer.port, targetServer.csrf, apiKey!, cascadeId, text, targetModel);
+          } catch (e: any) {
+            activeStreams.get(cascadeId)?.();
+            await sendFeishuText(openId, `❌ 发送失败: ${e.message}`, botConfig.appId, botConfig.appSecret);
           }
-          
-          
-          // MUST subscribe BEFORE sending the message!
-          await subscribeToAgent(cascadeId, openId, botConfig.appId, botConfig.appSecret);
-          await grpc.sendMessage(targetServer.port, targetServer.csrf, apiKey!, cascadeId, text, targetModel);
-        } catch (e: any) {
-          await sendFeishuText(openId, `❌ 发送失败: ${e.message}`, botConfig.appId, botConfig.appSecret);
+          } catch (wsErr: any) {
+            console.error('[FEISHU_DISPATCH_WORKSPACE_ERROR]', wsErr);
+          }
+          })();
         }
-        } catch (wsErr: any) {
-          console.error('[FEISHU_DISPATCH_WORKSPACE_ERROR]', wsErr);
-        }
-      }
-    });
+      });
 
-    await wsClient.start({ eventDispatcher });
-    workspaceWSClients.set(wsUri, wsClient);
-    console.log(`[Feishu] Workspace bot started: ${wsLabel} (appId=${botConfig.appId.slice(0, 10)}...)`);
-    return { success: true };
-  } catch (e: any) {
-    console.error(`[Feishu] Failed to start workspace bot for ${botConfig.workspaceUri}:`, e);
-    return { success: false, error: e.message };
+      await wsClient.start({ eventDispatcher });
+      workspaceWSClients.set(botConfig.appId, wsClient);
+      console.log(`[Feishu] Workspace bot started: ${wsLabel} (appId=${botConfig.appId.slice(0, 10)}...)`);
+      return { success: true };
+    } catch (e: any) {
+      console.error(`[Feishu] Failed to start workspace bot for ${botConfig.workspaceUri}:`, e);
+      return { success: false, error: e.message };
+    }
+  });
+
+  workspaceWSLocks.set(botConfig.appId, runPromise);
+  try {
+    return await runPromise;
+  } finally {
+    if (workspaceWSLocks.get(botConfig.appId) === runPromise) {
+      workspaceWSLocks.delete(botConfig.appId);
+    }
   }
 }
 
@@ -1098,24 +1196,29 @@ export async function startWorkspaceBotClient(botConfig: WorkspaceBotConfig): Pr
 export async function startAllWorkspaceBots() {
   const bots = workspaceBotStore.getAll().filter(b => b.enabled);
   for (const bot of bots) {
-    if (!workspaceWSClients.has(bot.workspaceUri)) {
+    if (!workspaceWSClients.has(bot.appId)) {
       await startWorkspaceBotClient(bot);
     }
   }
 }
 
-/** Stop a workspace bot */
-export function stopWorkspaceBotClient(workspaceUri: string) {
-  const client = workspaceWSClients.get(workspaceUri);
-  if (client) {
-    console.log(`[Feishu] Stopping workspace bot for: ${workspaceUri}`);
-    try {
-      const origProto = Object.getPrototypeOf(client);
-      if (typeof origProto.close === 'function') {
-        (client as any).close();
-      }
-    } catch {}
-    workspaceWSClients.delete(workspaceUri);
+/** Stop a workspace bot by appId (or by workspaceUri as fallback) */
+export function stopWorkspaceBotClient(idOrWorkspaceUri: string) {
+  const directClient = workspaceWSClients.get(idOrWorkspaceUri);
+  if (directClient) {
+    console.log(`[Feishu] Stopping workspace bot appId=${idOrWorkspaceUri}`);
+    closeWsClientSafely(directClient);
+    workspaceWSClients.delete(idOrWorkspaceUri);
+    return;
+  }
+  const matchingBots = workspaceBotStore.getAll().filter(b => b.workspaceUri === idOrWorkspaceUri);
+  for (const bot of matchingBots) {
+    const client = workspaceWSClients.get(bot.appId);
+    if (client) {
+      console.log(`[Feishu] Stopping workspace bot appId=${bot.appId} (${idOrWorkspaceUri})`);
+      closeWsClientSafely(client);
+      workspaceWSClients.delete(bot.appId);
+    }
   }
 }
 
@@ -1128,7 +1231,7 @@ export function getWorkspaceBotStatuses() {
     appId: b.appId,
     preferredModel: b.preferredModel,
     enabled: b.enabled,
-    connected: workspaceWSClients.has(b.workspaceUri)
+    connected: workspaceWSClients.has(b.appId)
   }));
 }
 
